@@ -1,0 +1,45 @@
+# WEB FRAMEWORK
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+
+# DATABASE (Optional - using SQLite for demo)
+sqlalchemy
+# psycopg2-binary  # Commented out - not needed for localhost demo
+# alembic  # Commented out - not needed for localhost demo
+
+# AUTH & SECURITY (Commented out for demo)
+# python-jose[cryptography]
+# passlib[bcrypt]
+# pyjwt
+
+# ENVIRONMENT
+python-dotenv
+
+# OCR & IMAGE PROCESSING
+pytesseract
+easyocr
+opencv-python
+pillow
+numpy
+
+# PDF PROCESSING
+PyMuPDF
+
+# AI & LLM (GROQ ONLY)
+httpx
+tenacity
+
+# EMBEDDINGS & RAG
+sentence-transformers
+chromadb
+
+# TASK QUEUE (Commented out - not needed for localhost demo)
+# celery
+# redis
+
+# UTILITIES
+requests
+tqdm
+

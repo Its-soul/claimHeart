@@ -1,0 +1,550 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Protocol
+
+from app.core.groq_client import get_groq_client, GroqAPIError
+from app.schemas.fraud import (
+    ClaimContext,
+    DecisionResponse,
+    FraudDecision,
+    FraudSignal,
+    LLMDecisionPayload,
+)
+from app.services.mock_db2_repo import db2_repo
+from app.services.ml_anomaly import ml_anomaly_scorer
+from app.services.rag_3_fraud_context import rag_3_fraud_context
+
+logger = logging.getLogger(__name__)
+
+
+class LLMClient(Protocol):
+    def complete(self, prompt: str) -> str:
+        ...
+
+
+@dataclass
+class RuleScoreResult:
+    risk_score: int
+    reasons: List[str]
+    signals: List[FraudSignal]
+    metadata: Dict[str, Any]
+
+
+class GroqDecisionClient:
+    """Groq-based LLM client for fraud decision making"""
+
+    def __init__(self, model: Optional[str] = None) -> None:
+        """
+        Initialize Groq decision client
+
+        Args:
+            model: Groq model to use (defaults to env GROQ_MODEL)
+        """
+        self._client = get_groq_client()
+        self._model = model or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        logger.info(f"Initialized Groq decision client with model: {self._model}")
+
+    def complete(self, prompt: str) -> str:
+        """
+        Generate completion using Groq
+
+        Args:
+            prompt: Input prompt
+
+        Returns:
+            JSON string response
+        """
+        system_prompt = (
+            "You are an insurance fraud decision engine. "
+            "Analyze the provided claim context and return a JSON decision. "
+            "Return only valid JSON with no additional text."
+        )
+
+        try:
+            response = self._client.complete(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                temperature=0,
+                max_tokens=2048,
+                json_mode=True,
+            )
+            return response
+        except GroqAPIError as e:
+            logger.error(f"Groq API error: {e}")
+            # Return empty JSON on error to trigger fallback
+            return "{}"
+
+
+class DecisionEngine:
+    def __init__(
+        self,
+        llm_client=None,
+        uncertainty_confidence_threshold: float = 0.65,
+        enable_llm: bool = True,
+    ) -> None:
+        """
+        Initialize fraud decision engine
+
+        Args:
+            llm_client: Optional LLM client (uses Groq by default)
+            uncertainty_confidence_threshold: Confidence threshold for uncertainty
+            enable_llm: Whether to enable LLM-based decisions
+        """
+        self._uncertainty_confidence_threshold = uncertainty_confidence_threshold
+        self._enable_llm = enable_llm
+
+        # Initialize Groq client if LLM is enabled
+        if enable_llm and llm_client is None:
+            try:
+                self._llm_client = GroqDecisionClient()
+                logger.info("Fraud engine initialized with Groq LLM")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Groq client: {e}. Using rule-based only.")
+                self._llm_client = None
+        else:
+            self._llm_client = llm_client
+
+        if not self._enable_llm or self._llm_client is None:
+            logger.info("Fraud engine running in rule-based mode only")
+
+    def evaluate(self, context: ClaimContext) -> DecisionResponse:
+        rule_result = self._compute_rule_risk(context)
+        llm_payload = self._evaluate_with_llm(context, rule_result)
+        decision = self._compose_decision(context, rule_result, llm_payload)
+        
+        # Write findings to DB2 module (Simulated)
+        claim_id = context.claim_data.get("claim_id", "UNKNOWN_CLAIM")
+        db2_repo.save_fraud_decision(claim_id, decision)
+        
+        return decision
+
+    def build_prompt(self, context: ClaimContext, rule_result: RuleScoreResult) -> str:
+        compact_context = {
+            "claim_data": context.claim_data,
+            "policy_rules": context.policy_rules,
+            "fraud_patterns": context.fraud_patterns,
+            "ocr_text": context.ocr_text,
+            "ocr_confidence": context.ocr_confidence,
+            "rule_based_risk_score": rule_result.risk_score,
+            "rule_based_reasons": rule_result.reasons,
+            "signals": [self._model_to_dict(signal) for signal in rule_result.signals],
+        }
+        instructions = {
+            "task": "Determine whether the claim should be APPROVE, FLAG, or REJECT.",
+            "constraints": [
+                "Return strict JSON only.",
+                "Use fields: decision, confidence, reasons.",
+                "confidence must be between 0 and 1.",
+                "reasons must be a list of concise explanations.",
+                "If evidence is incomplete, OCR is noisy, or uncertainty remains, choose FLAG.",
+                "Favor explainability and conservatism over creativity.",
+            ],
+            "json_schema": {
+                "decision": "APPROVE | FLAG | REJECT",
+                "confidence": "float 0..1",
+                "reasons": ["string"],
+            },
+        }
+        return (
+            f"{json.dumps(instructions, sort_keys=True)}\n"
+            f"{json.dumps(compact_context, sort_keys=True, default=str)}"
+        )
+
+        # def _evaluate_with_llm(
+        #     self,
+        #     context: ClaimContext,
+        #     rule_result: RuleScoreResult,
+        # ) -> Optional[LLMDecisionPayload]:
+        #     if self._llm_client is None:
+        #         return None
+
+        #     prompt = self.build_prompt(context, rule_result)
+        #     raw_response = self._llm_client.complete(prompt)
+        #     return self._parse_llm_response(raw_response)
+
+    def _evaluate_with_llm(
+        self,
+        context: ClaimContext,
+        rule_result: RuleScoreResult,
+    ) -> Optional[LLMDecisionPayload]:
+        """
+        Evaluate claim using Groq LLM
+
+        Args:
+            context: Claim context
+            rule_result: Rule-based evaluation result
+
+        Returns:
+            LLM decision payload or None if LLM unavailable
+        """
+        if self._llm_client is None:
+            return None
+
+        try:
+            prompt = self.build_prompt(context, rule_result)
+            raw_response = self._llm_client.complete(prompt)
+            return self._parse_llm_response(raw_response)
+        except Exception as e:
+            logger.error(f"LLM evaluation failed: {e}")
+            return None
+
+    def _parse_llm_response(self, raw_response: str) -> Optional[LLMDecisionPayload]:
+        try:
+            payload = json.loads(raw_response)
+        except json.JSONDecodeError:
+            payload = self._extract_json_object(raw_response)
+            if payload is None:
+                return None
+
+        try:
+            return LLMDecisionPayload.parse_obj(payload)
+        except Exception:
+            return None
+
+    def _extract_json_object(self, raw_response: str) -> Optional[Dict[str, Any]]:
+        match = re.search(r"\{.*\}", raw_response, re.DOTALL)
+        if not match:
+            return None
+
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+
+    def _compute_rule_risk(self, context: ClaimContext) -> RuleScoreResult:
+        signals: List[FraudSignal] = []
+        metadata: Dict[str, Any] = {}
+        claim_data = context.claim_data or {}
+
+        self._append_if_missing(claim_data, "claim_id", 8, "Claim identifier is missing.", signals)
+        self._append_if_missing(claim_data, "patient_id", 10, "Patient identifier is missing.", signals)
+        self._append_if_missing(claim_data, "claim_amount", 15, "Claim amount is missing.", signals)
+        self._append_if_missing(claim_data, "incident_date", 6, "Incident date is missing.", signals)
+
+        claim_amount = self._coerce_float(claim_data.get("claim_amount"))
+        approved_amount = self._coerce_float(claim_data.get("approved_amount"))
+        deductible = self._coerce_float(claim_data.get("deductible"))
+
+        if claim_amount is not None and claim_amount > 50000:
+            signals.append(
+                FraudSignal(
+                    code="HIGH_AMOUNT",
+                    weight=18,
+                    reason="Claim amount is materially high and warrants review.",
+                    metadata={"claim_amount": claim_amount},
+                )
+            )
+
+        if (
+            claim_amount is not None
+            and approved_amount is not None
+            and claim_amount > approved_amount * 1.5
+        ):
+            signals.append(
+                FraudSignal(
+                    code="AMOUNT_EXCEEDS_EXPECTED",
+                    weight=22,
+                    reason="Claim amount significantly exceeds expected approved amount.",
+                    metadata={
+                        "claim_amount": claim_amount,
+                        "approved_amount": approved_amount,
+                    },
+                )
+            )
+
+        if deductible is not None and claim_amount is not None and deductible > claim_amount:
+            signals.append(
+                FraudSignal(
+                    code="DEDUCTIBLE_ANOMALY",
+                    weight=12,
+                    reason="Deductible exceeds claim amount, which is inconsistent.",
+                    metadata={
+                        "deductible": deductible,
+                        "claim_amount": claim_amount,
+                    },
+                )
+            )
+
+        ocr_confidence = context.ocr_confidence
+        if ocr_confidence is not None:
+            metadata["ocr_confidence"] = ocr_confidence
+            if ocr_confidence < 0.65:
+                signals.append(
+                    FraudSignal(
+                        code="LOW_OCR_CONFIDENCE",
+                        weight=14,
+                        reason="OCR confidence is low, so source data may be unreliable.",
+                        metadata={"ocr_confidence": ocr_confidence},
+                    )
+                )
+
+        if context.ocr_text and self._looks_like_noisy_ocr(context.ocr_text):
+            signals.append(
+                FraudSignal(
+                    code="NOISY_OCR_TEXT",
+                    weight=10,
+                    reason="OCR text appears noisy or partially unreadable.",
+                )
+            )
+
+        # --- NEW AGENT A3 FRAUD CHECKS ---
+
+        # Fetch previous claims for duplicate detection
+        previous_claims = claim_data.get("previous_claims", [])
+
+        # 1. Duplicate Claim Suspicion
+        # patient_id + diagnosis + time window
+        diagnosis = str(claim_data.get("diagnosis", "")).lower()
+        if diagnosis:
+            for prev in previous_claims:
+                if str(prev.get("diagnosis", "")).lower() == diagnosis:
+                    signals.append(
+                        FraudSignal(
+                            code="DUPLICATE_CLAIM_SUSPICION",
+                            weight=30,
+                            reason="Claim matches a recent claim for the exact same diagnosis.",
+                            rule_id="RULE_DUP_01",
+                            detected_value=diagnosis,
+                            threshold_value="1 unique claim per window",
+                            metadata={"duplicate_hit": prev}
+                        )
+                    )
+                    break
+
+        # 2. Sub-Limit Bust interception
+        policy_hits = 0
+        for rule in context.policy_rules:
+            status = str(rule.get("decision", "APPROVE")).upper()
+            if status in {"FLAG", "REJECT"}:
+                policy_hits += 1
+                
+                # Check what type of policy violation happened (From Agent A2)
+                reason_str = str(rule.get("reason", []))
+                if "amount_exceeds_sublimit" in str(rule.get("flags", [])):
+                    signals.append(FraudSignal(
+                        code="SUB_LIMIT_BUST",
+                        weight=35,
+                        reason="Claim significantly exceeded the disease sub-limit cap.",
+                        rule_id="POL_CAP_01",
+                        detected_value=claim_amount,
+                        metadata={"rule_text": reason_str}
+                    ))
+                elif "protocol_violation_tests" in str(rule.get("flags", [])):
+                    signals.append(FraudSignal(
+                        code="TESTS_PER_DAY_EXCEEDED",
+                        weight=20,
+                        reason="Diagnostic tests ordered per day exceeded the protocol allowed limit.",
+                        rule_id="POL_PROT_01",
+                        metadata={"rule_text": reason_str}
+                    ))
+                else:
+                    signals.append(
+                        FraudSignal(
+                            code="POLICY_VIOLATION",
+                            weight=20,
+                            reason="Agent A2 Policy validation failed: " + reason_str,
+                            rule_id="POL_GEN_01"
+                        )
+                    )
+
+        # 3. Isolation Forest ML Anomaly Scoring
+        hospital_days = self._coerce_float(claim_data.get("hospital_stay_days")) or 2
+        # Use our ML module to find cluster outliers
+        ml_result = ml_anomaly_scorer.run_inference(claim_amount, ocr_confidence, hospital_days)
+        
+        if ml_result["is_outlier"]:
+            signals.append(FraudSignal(
+                code="ISOLATION_FOREST_ANOMALY",
+                weight=25,
+                reason="ML model detected an anomaly vector cluster across Amount/Days/Confidence.",
+                rule_id="ML_IF_01",
+                detected_value=str(ml_result["features"]),
+                threshold_value="Inlier Cluster Euclidean Distance",
+                metadata={"raw_anomaly_score": ml_result["raw_score"]}
+            ))
+
+        claim_summary = ", ".join(
+            [
+                str(claim_data.get("diagnosis") or "Unknown diagnosis"),
+                f"INR {claim_amount if claim_amount is not None else 'unknown'}",
+                f"{hospital_days} hospital days",
+                f"patient {claim_data.get('patient_id') or 'unknown'}",
+            ]
+        )
+        historical_context = rag_3_fraud_context.get_fraud_context(claim_summary)
+        if historical_context:
+            signals.append(
+                FraudSignal(
+                    code="HISTORICAL_PATTERN_MATCH",
+                    weight=15,
+                    reason="RAG 3 found similar historical fraud patterns for this claim type.",
+                    rule_id="RAG3_01",
+                    detected_value=claim_summary,
+                    metadata={"historical_context": historical_context},
+                )
+            )
+            metadata["rag3_historical_context"] = historical_context
+
+        fraud_pattern_hits = 0
+        for pattern in context.fraud_patterns:
+            matched = pattern.get("matched", True)
+            if matched:
+                fraud_pattern_hits += 1
+                severity = str(pattern.get("severity", "MEDIUM")).upper()
+                weight = {"LOW": 8, "MEDIUM": 14, "HIGH": 22}.get(severity, 14)
+                signals.append(
+                    FraudSignal(
+                        code=str(pattern.get("code") or "FRAUD_PATTERN"),
+                        weight=weight,
+                        reason=str(
+                            pattern.get("reason") or "Known fraud pattern matched."
+                        ),
+                        metadata={"pattern": pattern},
+                    )
+                )
+
+        metadata["policy_hits"] = policy_hits
+        metadata["fraud_pattern_hits"] = fraud_pattern_hits
+
+        raw_score = sum(signal.weight for signal in signals)
+
+        #risk_score = max(0, min(100, int(round(raw_score)))) old one
+
+        # Non-linear scaling (zyada realistic lagta hai)
+        risk_score = int(100 * (1 - (1 / (1 + raw_score / 50))))
+        risk_score = max(0, min(100, risk_score))
+        # Agar simple rakhna ho to old linear scoring bhi use kar sakte ho
+
+        reasons = [signal.reason for signal in signals]
+
+        if not reasons:
+            reasons.append("No rule-based fraud indicators were triggered.")
+
+        return RuleScoreResult(
+            risk_score=risk_score,
+            reasons=reasons,
+            signals=signals,
+            metadata=metadata,
+        )
+
+    def _compose_decision(
+        self,
+        context: ClaimContext,
+        rule_result: RuleScoreResult,
+        llm_payload: Optional[LLMDecisionPayload],
+    ) -> DecisionResponse:
+        if llm_payload is None:
+            llm_decision = FraudDecision.FLAG if rule_result.risk_score >= 35 else FraudDecision.APPROVE
+            llm_confidence = 0.55 if rule_result.risk_score >= 35 else 0.7
+            llm_reasons = ["LLM unavailable; used deterministic rule-based fallback."]
+        else:
+            llm_decision = llm_payload.decision
+            llm_confidence = llm_payload.confidence
+            llm_reasons = llm_payload.reasons
+
+        cleanliness_score = 1 - (rule_result.risk_score / 100)
+        effective_confidence = round(
+            min(1.0, max(0.0, (cleanliness_score * 0.45) + (llm_confidence * 0.55))),
+            4,
+        )
+
+        decision = self._finalize_decision(
+            rule_risk_score=rule_result.risk_score,
+            llm_decision=llm_decision,
+            llm_confidence=llm_confidence,
+            has_low_quality_input=self._has_low_quality_input(context),
+        )
+
+        reasons = self._deduplicate_reasons(rule_result.reasons + llm_reasons)
+
+        return DecisionResponse(
+            decision=decision,
+            confidence=effective_confidence,
+            risk_score=rule_result.risk_score,
+            reasons=reasons[:10],
+            signals=rule_result.signals,
+            metadata={
+                **rule_result.metadata,
+                "llm_used": llm_payload is not None,
+                "llm_decision": llm_decision.value,
+                "llm_confidence": llm_confidence,
+            },
+        )
+
+    def _finalize_decision(
+        self,
+        rule_risk_score: int,
+        llm_decision: FraudDecision,
+        llm_confidence: float,
+        has_low_quality_input: bool,
+    ) -> FraudDecision:
+        if has_low_quality_input or llm_confidence < self._uncertainty_confidence_threshold:
+            return FraudDecision.FLAG
+        if rule_risk_score >= 85:
+            return FraudDecision.REJECT
+        if rule_risk_score >= 45:
+            return FraudDecision.FLAG
+        if llm_decision == FraudDecision.REJECT and rule_risk_score >= 70:
+            return FraudDecision.REJECT
+        if llm_decision == FraudDecision.APPROVE and rule_risk_score < 35:
+            return FraudDecision.APPROVE
+        return FraudDecision.FLAG if rule_risk_score >= 35 else FraudDecision.APPROVE
+
+    def _has_low_quality_input(self, context: ClaimContext) -> bool:
+        required_fields = ("claim_id", "patient_id", "claim_amount")
+        missing_required = any(not context.claim_data.get(field) for field in required_fields)
+        low_ocr_confidence = context.ocr_confidence is not None and context.ocr_confidence < 0.65
+        noisy_ocr = bool(context.ocr_text and self._looks_like_noisy_ocr(context.ocr_text))
+        return missing_required or low_ocr_confidence or noisy_ocr
+
+    def _append_if_missing(
+        self,
+        payload: Dict[str, Any],
+        key: str,
+        weight: float,
+        reason: str,
+        signals: List[FraudSignal],
+    ) -> None:
+        if payload.get(key) in (None, "", [], {}):
+            signals.append(FraudSignal(code=f"MISSING_{key.upper()}", weight=weight, reason=reason))
+
+    def _looks_like_noisy_ocr(self, text: str) -> bool:
+        stripped = re.sub(r"\s+", "", text)
+        if not stripped:
+            return True
+        symbol_count = sum(1 for char in stripped if not char.isalnum())
+        symbol_ratio = symbol_count / len(stripped)
+        return symbol_ratio > 0.35 or "??" in text or "�" in text
+
+    def _coerce_float(self, value: Any) -> Optional[float]:
+        if value in (None, "", [], {}):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        cleaned = re.sub(r"[^0-9.\-]", "", str(value))
+        if not cleaned:
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+
+    def _deduplicate_reasons(self, reasons: List[str]) -> List[str]:
+        seen = set()
+        deduped: List[str] = []
+        for reason in reasons:
+            normalized = reason.strip()
+            if normalized and normalized not in seen:
+                deduped.append(normalized)
+                seen.add(normalized)
+        return deduped
+
+    def _model_to_dict(self, model: Any) -> Dict[str, Any]:
+        if hasattr(model, "model_dump"):
+            return model.model_dump()
+        return model.dict()

@@ -1,0 +1,120 @@
+# =========================
+# Node.js / Frontend
+# =========================
+node_modules/
+.npm/
+dist/
+build/
+coverage/
+.next/
+out/
+next-env.d.ts
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# Packaging / logs
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+
+# Testing / cache
+.hypothesis/
+.pytest_cache/
+
+# =========================
+# ML / AI / Models (IMPORTANT)
+# =========================
+# HuggingFace cache (your current issue)
+**/hf_cache/
+**/hf_cache_local/
+.cache/
+.huggingface/
+
+# Model weights / embeddings
+*.bin
+*.pt
+*.pth
+*.onnx
+*.h5
+
+# Vector DB / embeddings storage
+*.faiss
+*.pkl
+*.joblib
+
+# ChromaDB storage
+**/chroma_store/
+*.chroma
+
+# =========================
+# OCR / Temp files
+# =========================
+*.pdf
+*.png
+*.jpg
+*.jpeg
+temp/
+uploads/
+temp_uploads/
+outputs/
+
+# =========================
+# Environment / Secrets (CRITICAL)
+# =========================
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# API Keys and secrets
+**/secrets/
+*.key
+*.pem
+*.crt
+
+# =========================
+# Docker / Infrastructure
+# =========================
+docker-compose.override.yml
+*.log
+
+# =========================
+# Database
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+
+# =========================
+# OS / IDE
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# Misc
+# =========================
+index.html
